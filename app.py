@@ -16,6 +16,231 @@ import joblib
 import base64
 from werkzeug.utils import secure_filename
 import tempfile
+
+class PersonIdentifier:
+    def __init__(self):
+        self.name_patterns = [
+            r'(?:Mr\.|Mrs\.|Ms\.|Dr\.)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',  # Titles with names
+            r'Name:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',                     # Names with "Name:" prefix
+            r'(?m)^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)$',                       # Names on their own line
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)'                              # General names
+        ]
+        self.id_patterns = {
+            'ssn': r'(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}',
+            'drivers_license': r'[A-Z]\d{7}',
+            'passport': r'[A-Z]\d{8}',
+        }
+        self.email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
+
+    def identify_person(self, text: str) -> Dict:
+        person_data = {
+            'name': None,
+            'id_numbers': {},
+            'email': None
+        }
+        
+        # Extract name with improved patterns
+        for pattern in self.name_patterns:
+            names = re.findall(pattern, text)
+            if names:
+                person_data['name'] = names[0].strip()
+                break
+        
+        # Extract IDs
+        for id_type, pattern in self.id_patterns.items():
+            ids = re.findall(pattern, text)
+            if ids:
+                person_data['id_numbers'][id_type] = ids[0]
+        
+        # Extract email
+        emails = re.findall(self.email_pattern, text)
+        if emails:
+            person_data['email'] = emails[0]
+            
+        return person_data
+
+class MLDocumentClassifier:
+    def __init__(self):
+        self.labels = [
+            'Invoice',
+            'BankApplication_CreditCard',
+            'BankApplication_SavingsAccount',
+            'ID_DriversLicense',
+            'ID_Passport',
+            'ID_StateID',
+            'Financial_PayStub',
+            'Financial_TaxReturn',
+            'Financial_IncomeStatement',
+            'Receipt'
+        ]
+        
+    def predict(self, text):
+        return self._rule_based_classify(text)
+    
+    def _rule_based_classify(self, text):
+        text_lower = text.lower()
+        
+        # Primary document indicators (strong signals)
+        if 'invoice' in text_lower or 'inv-' in text_lower:
+            return 'Invoice'
+            
+        rules = [
+            ('BankApplication_CreditCard', ['credit card application', 'card request', 'new card']),
+            ('BankApplication_SavingsAccount', ['savings account', 'open account', 'new account']),
+            ('ID_DriversLicense', ['driver license', 'driving permit', 'operator license']),
+            ('ID_Passport', ['passport', 'travel document']),
+            ('ID_StateID', ['state id', 'identification card']),
+            ('Financial_PayStub', ['pay stub', 'salary', 'wages']),
+            ('Financial_TaxReturn', ['tax return', 'form 1040', 'tax year']),
+            ('Financial_IncomeStatement', ['income statement', 'earnings report']),
+            ('Receipt', ['receipt', 'payment received', 'transaction record'])
+        ]
+        
+        max_score = 0
+        best_type = 'Unknown'
+        
+        for doc_type, keywords in rules:
+            score = sum(1 for keyword in keywords if keyword in text_lower)
+            weighted_score = score / len(keywords) if keywords else 0
+            if weighted_score > max_score:
+                max_score = weighted_score
+                best_type = doc_type
+                
+        return best_type
+
+class EnhancedDocProcessor:
+    def __init__(self):
+        self.conn = sqlite3.connect(':memory:', check_same_thread=False)
+        self.setup_database()
+        self.classifier = MLDocumentClassifier()
+        self.person_identifier = PersonIdentifier()
+        
+    def setup_database(self):
+        self.conn.executescript('''
+            CREATE TABLE IF NOT EXISTS persons (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                email TEXT,
+                ssn TEXT,
+                drivers_license TEXT,
+                passport TEXT,
+                created_date TEXT
+            );
+            
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY,
+                filename TEXT,
+                doc_type TEXT,
+                person_id INTEGER,
+                amount REAL,
+                date TEXT,
+                account_number TEXT,
+                raw_text TEXT,
+                processed_date TEXT,
+                file_hash TEXT,
+                confidence_score REAL,
+                FOREIGN KEY (person_id) REFERENCES persons (id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS similar_docs (
+                doc_id INTEGER,
+                similar_doc_id INTEGER,
+                similarity_score REAL,
+                FOREIGN KEY (doc_id) REFERENCES documents (id),
+                FOREIGN KEY (similar_doc_id) REFERENCES documents (id)
+            );
+        ''')
+        self.conn.commit()
+
+    def extract_text(self, pdf_path: str) -> str:
+        try:
+            text_parts = []
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        text_parts.append(text)
+            return "\n".join(text_parts)
+        except Exception as e:
+            return f"Error extracting text: {str(e)}"
+
+    def extract_metadata(self, text: str) -> Dict:
+        metadata = {
+            'amount': next((float(amt.replace('$','').replace(',','')) 
+                          for amt in re.findall(r'\$[\d,]+\.?\d*', text)), 0.0),
+            'date': next(iter(re.findall(r'\d{1,2}/\d{1,2}/\d{4}', text)), None),
+            'account_number': next(iter(re.findall(r'Account\s*#?\s*:?\s*(\d{8,12})', text)), None),
+        }
+        return metadata
+
+    def get_or_create_person(self, person_data: Dict) -> int:
+        cursor = self.conn.execute(
+            'SELECT id FROM persons WHERE name = ? OR email = ? OR ssn = ? OR drivers_license = ? OR passport = ?',
+            (person_data['name'], person_data.get('email'), 
+             person_data.get('id_numbers', {}).get('ssn'),
+             person_data.get('id_numbers', {}).get('drivers_license'),
+             person_data.get('id_numbers', {}).get('passport'))
+        )
+        result = cursor.fetchone()
+        
+        if result:
+            return result[0]
+            
+        cursor = self.conn.execute('''
+            INSERT INTO persons (name, email, ssn, drivers_license, passport, created_date)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            person_data['name'],
+            person_data.get('email'),
+            person_data.get('id_numbers', {}).get('ssn'),
+            person_data.get('id_numbers', {}).get('drivers_license'),
+            person_data.get('id_numbers', {}).get('passport'),
+            datetime.now().isoformat()
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def process_document(self, pdf_path: str, filename: str) -> Dict:
+        text = self.extract_text(pdf_path)
+        doc_type = self.classifier.predict(text)
+        metadata = self.extract_metadata(text)
+        person_data = self.person_identifier.identify_person(text)
+        person_id = self.get_or_create_person(person_data)
+        
+        cursor = self.conn.execute('''
+            INSERT INTO documents 
+            (filename, doc_type, person_id, amount, date, 
+             account_number, raw_text, processed_date, confidence_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            filename, doc_type, person_id,
+            metadata['amount'], metadata['date'],
+            metadata['account_number'], text,
+            datetime.now().isoformat(), 0.85
+        ))
+        
+        doc_id = cursor.lastrowid
+        self.conn.commit()
+        
+        return {
+            'id': doc_id,
+            'filename': filename,
+            'doc_type': doc_type,
+            'person': person_data,
+            **metadata
+        }
+
+    def process_batch(self, file_paths: List[str]) -> List[Dict]:
+        results = []
+        for file_path in file_paths:
+            try:
+                result = self.process_document(file_path, os.path.basename(file_path))
+                results.append({"status": "success", "result": result, "file": file_path})
+            except Exception as e:
+                results.append({"status": "error", "error": str(e), "file": file_path})
+        return results
+
 # HTML template with embedded JavaScript
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -129,6 +354,7 @@ HTML_TEMPLATE = """
             }
         }
 
+
         processButton.addEventListener('click', async () => {
             if (files.length === 0) return;
 
@@ -183,7 +409,7 @@ HTML_TEMPLATE = """
                         </div>
                         <div>
                             <span class="text-gray-600">Person:</span>
-                            <span class="ml-2">${result.result.person_name}</span>
+                            <span class="ml-2">${result.result.person?.name || 'N/A'}</span>
                         </div>
                     </div>
                 </div>
@@ -193,130 +419,6 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
-
-class MLDocumentClassifier:
-    def __init__(self):
-        self.labels = ['Invoice', 'Statement', 'Contract', 'Receipt', 'Report', 'Letter', 'Form']
-        self.classifier = Pipeline([
-            ('tfidf', TfidfVectorizer(ngram_range=(1, 2), stop_words='english', max_features=10000)),
-            ('clf', MultinomialNB())
-        ])
-        self.is_trained = False
-        
-    def predict(self, text):
-        return self._rule_based_classify(text)
-    
-    def _rule_based_classify(self, text):
-        text_lower = text.lower()
-        rules = [
-            ('Invoice', ['invoice', 'bill', 'payment due', 'amount due']),
-            ('Statement', ['statement', 'balance', 'transaction history']),
-            ('Contract', ['contract', 'agreement', 'terms and conditions']),
-            ('Receipt', ['receipt', 'purchased', 'payment received']),
-            ('Report', ['report', 'analysis', 'findings']),
-            ('Letter', ['dear', 'sincerely', 'regards']),
-            ('Form', ['form', 'please fill', 'application'])
-        ]
-        
-        scores = []
-        for doc_type, keywords in rules:
-            score = sum(1 for keyword in keywords if keyword in text_lower)
-            scores.append((doc_type, score / len(keywords) if keywords else 0))
-        
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[0][0]
-
-class EnhancedDocProcessor:
-    def __init__(self):
-        self.conn = sqlite3.connect(':memory:', check_same_thread=False)
-        self.setup_database()
-        self.classifier = MLDocumentClassifier()
-        
-    def setup_database(self):
-        self.conn.executescript('''
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY,
-                filename TEXT,
-                doc_type TEXT,
-                person_name TEXT,
-                amount REAL,
-                date TEXT,
-                account_number TEXT,
-                raw_text TEXT,
-                processed_date TEXT,
-                file_hash TEXT,
-                version INTEGER,
-                user_id TEXT
-            );
-            
-            CREATE TABLE IF NOT EXISTS similar_docs (
-                doc_id INTEGER,
-                similar_doc_id INTEGER,
-                similarity_score REAL,
-                FOREIGN KEY (doc_id) REFERENCES documents (id),
-                FOREIGN KEY (similar_doc_id) REFERENCES documents (id)
-            );
-        ''')
-        self.conn.commit()
-
-    def extract_text(self, pdf_path: str) -> str:
-        try:
-            text_parts = []
-            with open(pdf_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        text_parts.append(text)
-            return "\n".join(text_parts)
-        except Exception as e:
-            return f"Error extracting text: {str(e)}"
-
-    def extract_metadata(self, text: str) -> Dict:
-        return {
-            'amount': next((float(amt.replace('$','').replace(',','')) 
-                          for amt in re.findall(r'\$[\d,]+\.?\d*', text)), 0.0),
-            'date': next(iter(re.findall(r'\d{1,2}/\d{1,2}/\d{4}', text)), None),
-            'account_number': next(iter(re.findall(r'Account\s*#?\s*:?\s*(\d{8,12})', text)), None),
-            'person_name': next(iter(re.findall(r'(?:Mr\.|Mrs\.|Ms\.|Dr\.)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)', text)), "Unknown")
-        }
-
-    def process_document(self, pdf_path: str, filename: str, user_id: str = None) -> Dict:
-        text = self.extract_text(pdf_path)
-        doc_type = self.classifier.predict(text)
-        metadata = self.extract_metadata(text)
-        
-        cursor = self.conn.execute('''
-            INSERT INTO documents 
-            (filename, doc_type, person_name, amount, date, 
-             account_number, raw_text, processed_date, user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            filename, doc_type, metadata['person_name'],
-            metadata['amount'], metadata['date'],
-            metadata['account_number'], text,
-            datetime.now().isoformat(), user_id
-        ))
-        
-        doc_id = cursor.lastrowid
-        self.conn.commit()
-        
-        return {
-            'id': doc_id,
-            'filename': filename,
-            'doc_type': doc_type,
-            **metadata
-        }
-
-    def process_batch(self, file_paths: List[str], user_id: str = None) -> List[Dict]:
-        results = []
-        for file_path in file_paths:
-            try:
-                result = self.process_document(file_path, os.path.basename(file_path), user_id)
-                results.append({"status": "success", "result": result, "file": file_path})
-            except Exception as e:
-                results.append({"status": "error", "error": str(e), "file": file_path})
-        return results
 
 app = Flask(__name__)
 processor = EnhancedDocProcessor()
@@ -331,25 +433,20 @@ def batch_process():
         return jsonify({'error': 'No files uploaded'}), 400
     
     files = request.files.getlist('files[]')
-    user_id = request.form.get('user_id')
     
-    # Create a temporary directory
     with tempfile.TemporaryDirectory() as temp_dir:
         file_paths = []
         for file in files:
             if file.filename.endswith('.pdf'):
-                # Create a secure filename
                 secure_name = secure_filename(file.filename)
-                # Create full path in temporary directory
                 temp_path = os.path.join(temp_dir, secure_name)
                 file.save(temp_path)
                 file_paths.append(temp_path)
         
         try:
-            results = processor.process_batch(file_paths, user_id)
+            results = processor.process_batch(file_paths)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-        # No need to manually clean up - TemporaryDirectory does it automatically
                 
         return jsonify(results)
 
